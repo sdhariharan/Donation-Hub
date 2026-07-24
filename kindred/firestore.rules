@@ -1,0 +1,181 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function currentUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isDonor() {
+      return signedIn() && currentUser().role == 'donor';
+    }
+
+    function isOrganization() {
+      return signedIn() && currentUser().role == 'organization';
+    }
+
+    function validTransition(from, to) {
+      return (from == 'Uploaded' && to == 'Accepted')
+        || (from == 'Accepted' && to == 'Ready for Pickup')
+        || (from == 'Ready for Pickup' && to == 'Received')
+        || (from == 'Received' && to == 'Completed');
+    }
+
+    function canReadDonation(data) {
+      return signedIn()
+        && (data.donorId == request.auth.uid
+          || data.selectedOrganizationId == request.auth.uid);
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && request.auth.uid == userId;
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role in ['donor', 'organization'];
+      allow update: if isDonor()
+        && request.auth.uid == userId
+        && resource.data.uid == request.resource.data.uid
+        && resource.data.email == request.resource.data.email
+        && resource.data.role == request.resource.data.role
+        && resource.data.createdAt == request.resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'phone', 'address', 'city', 'state', 'postalCode', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /organizations/{organizationId} {
+      // Authenticated donors need these fields for recommendation scoring.
+      allow read: if isDonor()
+        || (isOrganization() && request.auth.uid == organizationId);
+      allow create: if isOrganization()
+        && request.auth.uid == organizationId
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.trustScore == 70;
+      allow update: if isOrganization()
+        && request.auth.uid == organizationId
+        && resource.data.ownerId == request.auth.uid
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.trustScore == resource.data.trustScore
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'description', 'email', 'phone', 'address', 'city', 'state',
+          'postalCode', 'categoriesAccepted', 'inventory', 'needs', 'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    match /donations/{donationId} {
+      allow read: if canReadDonation(resource.data);
+      allow create: if isDonor()
+        && request.resource.data.donorId == request.auth.uid
+        && request.resource.data.status == 'Uploaded'
+        && (
+          (request.resource.data.selectedOrganizationId == null
+            && request.resource.data.selectedOrganizationName == null)
+          ||
+          (request.resource.data.selectedOrganizationId != null
+            && exists(
+              /databases/$(database)/documents/organizations/$(request.resource.data.selectedOrganizationId)
+            )
+            && request.resource.data.selectedOrganizationName ==
+              get(
+                /databases/$(database)/documents/organizations/$(request.resource.data.selectedOrganizationId)
+              ).data.name
+            && get(
+              /databases/$(database)/documents/organizations/$(request.resource.data.selectedOrganizationId)
+            ).data.categoriesAccepted.hasAny([request.resource.data.category]))
+        );
+
+      allow update: if
+        // Donors may edit only an unassigned, Uploaded donation.
+        (isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == 'Uploaded'
+          && resource.data.selectedOrganizationId == null
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.selectedOrganizationId == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'title', 'category', 'itemName', 'quantity', 'condition',
+            'description', 'pickupAddress', 'city', 'state', 'postalCode',
+            'imageUrl', 'imagePath', 'updatedAt'
+          ]))
+        ||
+        // A donor may assign an eligible donation to an existing organization.
+        (isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == 'Uploaded'
+          && resource.data.selectedOrganizationId == null
+          && request.resource.data.status == 'Uploaded'
+          && request.resource.data.selectedOrganizationId != null
+          && request.resource.data.selectedOrganizationName ==
+            get(/databases/$(database)/documents/organizations/$(request.resource.data.selectedOrganizationId)).data.name
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['selectedOrganizationId', 'selectedOrganizationName', 'updatedAt']))
+        ||
+        // The assigned organization controls the forward-only lifecycle.
+        (isOrganization()
+          && resource.data.selectedOrganizationId == request.auth.uid
+          && request.resource.data.selectedOrganizationId == request.auth.uid
+          && validTransition(resource.data.status, request.resource.data.status)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'updatedAt']));
+
+      allow delete: if isDonor()
+        && resource.data.donorId == request.auth.uid
+        && resource.data.status == 'Uploaded'
+        && resource.data.selectedOrganizationId == null;
+    }
+
+    match /tracking/{donationId} {
+      function relatedDonation() {
+        return get(/databases/$(database)/documents/donations/$(donationId)).data;
+      }
+
+      function resultingDonation() {
+        return getAfter(/databases/$(database)/documents/donations/$(donationId)).data;
+      }
+
+      allow read: if signedIn()
+        && (relatedDonation().donorId == request.auth.uid
+          || relatedDonation().selectedOrganizationId == request.auth.uid);
+
+      allow create: if isOrganization()
+        && request.resource.data.donationId == donationId
+        && request.resource.data.organizationId == request.auth.uid
+        && request.resource.data.donorId == resultingDonation().donorId
+        && resultingDonation().selectedOrganizationId == request.auth.uid
+        && resultingDonation().status == 'Accepted'
+        && request.resource.data.currentStatus == 'Accepted'
+        && request.resource.data.statusHistory.size() == 2
+        && request.resource.data.statusHistory[0].status == 'Uploaded'
+        && request.resource.data.statusHistory[1].status == 'Accepted';
+
+      allow update: if isOrganization()
+        && resource.data.organizationId == request.auth.uid
+        && request.resource.data.organizationId == resource.data.organizationId
+        && request.resource.data.donationId == resource.data.donationId
+        && request.resource.data.donorId == resource.data.donorId
+        && request.resource.data.createdAt == resource.data.createdAt
+        && validTransition(resource.data.currentStatus, request.resource.data.currentStatus)
+        && resultingDonation().status == request.resource.data.currentStatus
+        && request.resource.data.statusHistory.size() == resource.data.statusHistory.size() + 1
+        && request.resource.data.statusHistory[
+          request.resource.data.statusHistory.size() - 1
+        ].status == request.resource.data.currentStatus
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['currentStatus', 'statusHistory', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
